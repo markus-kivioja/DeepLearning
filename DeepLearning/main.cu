@@ -50,10 +50,12 @@ __global__ void dot(const float* vec1, const float* vec2, float* out)
     if (!threadIdx.x) *out = cache[0];
 }
 
-__global__ void gradientDescentStep(const void* variables, const void* partialDerivs, size_t pitch, float learningRate, size_t subsetSize)
+__global__ void gradientDescentStep(const void* variables, const void* partialDerivs, size_t pitch, float learningRate, size_t subsetSize, size_t cols)
 {
     size_t x = blockIdx.x * blockDim.x + threadIdx.x;
     size_t y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= cols) return;
 
     float* variablesRow = (float*)(((uint8_t*)variables) + y * pitch);
     float* partialDerivsRow = (float*)(((uint8_t*)partialDerivs) + y * pitch);
@@ -79,10 +81,12 @@ __global__ void layerActivation(const void* matrix, size_t pitch, size_t colCoun
     out[idx] = sigmoid(out[idx] + addVec[idx]);
 }
 
-__global__ void columnProduct(const float* vector1, const float* vector2, void* out, size_t pitch)
+__global__ void columnProduct(const float* vector1, const float* vector2, void* out, size_t pitch, size_t rows, size_t cols)
 {
-    size_t x = threadIdx.x;
-    size_t y = threadIdx.y;
+    size_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= cols || y >= rows) return;
 
     float* outRow = (float*)(((uint8_t*)out) + y * pitch);
     outRow[x] = vector1[y] * vector2[x];
@@ -116,6 +120,19 @@ __global__ void calcLayerError(const void* wTrans, size_t pitch, size_t colCount
     dot<<<1, colCount, colCount * sizeof(float)>>>(row, nextLayerError, &out[idx]);
     cudaDeviceSynchronize();
     out[idx] *= sigmoidDeriv(z[idx]);
+}
+
+__global__ void accumulate(void* mat1, const void* mat2, size_t rows, size_t cols, size_t pitch)
+{
+    size_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= cols || y >= rows) return;
+
+    float* row1 = (float*)(((uint8_t*)mat1) + y * pitch);
+    const float* row2 = (float*)(((uint8_t*)mat2) + y * pitch);
+
+    row1[x] += row2[x];
 }
 
 class NeuralNetwork {
@@ -165,6 +182,8 @@ public:
             checkCudaErrors(cudaMalloc3D(&wDevice, extent));
             checkCudaErrors(cudaMemset3D(wDevice, 0, extent));
             m_wPartDerivs.push_back(wDevice);
+            checkCudaErrors(cudaMalloc3D(&wDevice, extent));
+            m_wPartDerivsDelta.push_back(wDevice);
 
             // Initialize biases and copy to GPU
             float* bHost;
@@ -183,6 +202,8 @@ public:
             checkCudaErrors(cudaMalloc(&bDevice, rows * sizeof(float)));
             checkCudaErrors(cudaMemset(bDevice, 0, rows * sizeof(float)));
             m_bPartDerivs.push_back(bDevice);
+            checkCudaErrors(cudaMalloc(&bDevice, rows * sizeof(float)));
+            m_bPartDerivsDelta.push_back(bDevice);
         }
     }
 
@@ -227,7 +248,7 @@ public:
 
         for (auto a : as) checkCudaErrors(cudaFree(a));
 
-        return std::max_element(result.begin(), result.begin() + 10) - result.begin();
+        return static_cast<uint8_t>(std::max_element(result.begin(), result.begin() + 10) - result.begin());
     }
 
     void learn(std::vector<float*>& xs, std::vector<float*>& ys, uint32_t epochCount, uint32_t subsetSize, float learningRate)
@@ -300,16 +321,26 @@ public:
             float* y = ys[i];
 
             backpropagate(x, y);
+
+            for (size_t layer = 0; layer < m_layerCount - 1; layer++)
+            {
+                int32_t rows = m_neuronCounts[layer + 1];
+                int32_t cols = m_neuronCounts[layer];
+                dim3 gridSize(static_cast<uint32_t>(std::ceil((float)cols / (float)rows)));
+                dim3 blockSize(rows, rows);
+                accumulate<<<gridSize, blockSize>>>(m_wPartDerivs[layer].ptr, m_wPartDerivsDelta[layer].ptr, rows, cols, m_wPartDerivs[layer].pitch);
+                accumulate<<<1, rows>>>(m_bPartDerivs[layer], m_bPartDerivsDelta[layer], 1, rows, sizeof(float));
+            }
         }
         // Update weights and biases
         for (size_t layer = 0; layer < m_layerCount - 1; layer++)
         {
             int32_t rows = m_neuronCounts[layer + 1];
             int32_t cols = m_neuronCounts[layer];
-            dim3 gridSize(static_cast<uint32_t>(std::ceil(cols / rows)));
+            dim3 gridSize(static_cast<uint32_t>(std::ceil((float)cols / (float)rows)));
             dim3 blockSize(rows, rows);
-            gradientDescentStep<<<gridSize, blockSize>>>(m_w[layer].ptr, m_wPartDerivs[layer].ptr, m_w[layer].pitch, learningRate, xs.size());
-            gradientDescentStep<<<1, rows>>>(m_b[layer], m_bPartDerivs[layer], sizeof(float), learningRate, xs.size());
+            gradientDescentStep<<<gridSize, blockSize>>>(m_w[layer].ptr, m_wPartDerivs[layer].ptr, m_w[layer].pitch, learningRate, xs.size(), cols);
+            gradientDescentStep<<<1, rows>>>(m_b[layer], m_bPartDerivs[layer], sizeof(float), learningRate, xs.size(), cols);
         }
     }
 
@@ -341,10 +372,12 @@ public:
             sigmoid<<<1, rows>>>(z, aNext);
         }
         uint32_t lastLayerSize = m_neuronCounts[m_neuronCounts.size() - 1];
-        calcOutputError<<<1, lastLayerSize>>>(as[as.size() - 1], y, zs[zs.size() - 1], m_bPartDerivs[m_bPartDerivs.size() - 1]);
+        calcOutputError<<<1, lastLayerSize>>>(as[as.size() - 1], y, zs[zs.size() - 1], m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1]);
         
         dim3 blockSize(m_neuronCounts[m_neuronCounts.size() - 2], m_neuronCounts[m_neuronCounts.size() - 1]);
-        columnProduct<<<1, blockSize >>>(m_bPartDerivs[m_bPartDerivs.size() - 1], as[as.size() - 2], m_wPartDerivs[m_wPartDerivs.size() - 1].ptr, m_wPartDerivs[m_wPartDerivs.size() - 1].pitch);
+        columnProduct<<<1, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1], as[as.size() - 2], 
+            m_wPartDerivsDelta[m_wPartDerivsDelta.size() - 1].ptr, m_wPartDerivsDelta[m_wPartDerivsDelta.size() - 1].pitch,
+            m_neuronCounts[m_neuronCounts.size() - 1], m_neuronCounts[m_neuronCounts.size() - 2]);
 
         for (size_t layer = 2; layer < m_layerCount; layer++)
         {
@@ -357,10 +390,14 @@ public:
             checkCudaErrors(cudaMalloc3D(&wTrans, wTransExtent));
             dim3 blockSize(cols, rows);
             matTranspose<<<1, blockSize>>>(m_w[m_w.size() - layer + 1].ptr, m_w[m_w.size() - layer + 1].pitch, wTrans.ptr, wTrans.pitch);
-            calcLayerError<<<1, cols>>>(wTrans.ptr, wTrans.pitch, rows, m_bPartDerivs[m_bPartDerivs.size() - layer + 1], z, m_bPartDerivs[m_bPartDerivs.size() - layer]);
+            calcLayerError<<<1, cols>>>(wTrans.ptr, wTrans.pitch, rows, m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer + 1], z, m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer]);
 
-            blockSize = dim3(m_neuronCounts[m_neuronCounts.size() - layer - 1], m_neuronCounts[m_neuronCounts.size() - layer]);
-            columnProduct<<<1, blockSize>>>(m_bPartDerivs[m_bPartDerivs.size() - layer], as[as.size() - layer - 1], m_wPartDerivs[m_wPartDerivs.size() - layer].ptr, m_wPartDerivs[m_wPartDerivs.size() - layer].pitch);
+            rows = m_neuronCounts[m_neuronCounts.size() - layer];
+            cols = m_neuronCounts[m_neuronCounts.size() - layer - 1];
+            dim3 gridSize(static_cast<uint32_t>(std::ceil((float)cols / (float)rows)));
+            blockSize = dim3(rows, rows);
+            columnProduct<<<gridSize, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer], as[as.size() - layer - 1], 
+                m_wPartDerivsDelta[m_wPartDerivsDelta.size() - layer].ptr, m_wPartDerivsDelta[m_wPartDerivsDelta.size() - layer].pitch, rows, cols);
 
             checkCudaErrors(cudaFree(wTrans.ptr));
         }
@@ -381,6 +418,9 @@ private:
 
     std::vector<cudaPitchedPtr> m_wPartDerivs;
     std::vector<float*> m_bPartDerivs;
+
+    std::vector<cudaPitchedPtr> m_wPartDerivsDelta;
+    std::vector<float*> m_bPartDerivsDelta;
 };
 
 int main()
@@ -395,7 +435,7 @@ int main()
     std::vector<uint32_t> neuronCounts = { elementSize, 30, 10 };
     NeuralNetwork network(neuronCounts);
 
-    network.learn(xs, ys, 2, 10, 3.0f);
+    network.learn(xs, ys, 1, 10, 3.0f);
 
     for (int i = 0; i < xs.size(); i++)
     {
@@ -419,7 +459,7 @@ int main()
             printf("\n");
         }*/
         int image = i;
-        uint8_t label = std::max_element(testLabels[image], testLabels[image] + 10) - testLabels[image];
+        uint8_t label = static_cast<uint8_t>(std::max_element(testLabels[image], testLabels[image] + 10) - testLabels[image]);
         uint8_t digit = network.recognizeDigit(testImages[image]);
         if (label == digit) corrects++;
         //printf("Real value is %d, network thinks it's %d\n", label, digit);
