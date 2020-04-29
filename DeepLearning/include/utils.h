@@ -44,7 +44,7 @@ namespace {
         }
     }
 
-    void loadData(const wchar_t* xFilename, std::vector<float*>& xs, const wchar_t* yFilename, std::vector<float*>& ys, uint32_t& elementSize)
+    void loadData(const wchar_t* xFilename, std::vector<double*>& xs, const wchar_t* yFilename, std::vector<double*>& ys, uint32_t& elementSize)
     {
         uint8_t* imageData;
         loadBinary(xFilename, imageData);
@@ -63,16 +63,16 @@ namespace {
 
         for (uint32_t i = 0; i < imageCount; i++)
         {
-            float* x = new float[pixelCount] { 0 };
+            double* x = new double[pixelCount] { 0 };
             for (uint32_t j = 0; j < pixelCount; j++)
             {
-                x[j] = (float)(imageData[pixelCount * i + j]) / 255.0f;
+                x[j] = (double)(imageData[pixelCount * i + j]) / 255.0;
             }
             xs[i] = x;
 
             uint8_t label = labelsData[i];
-            float* y = new float[10]{ 0 };
-            y[label] = 1.0f;
+            double* y = new double[10]{ 0 };
+            y[label] = 1.0;
             ys[i] = y;
         }
 
