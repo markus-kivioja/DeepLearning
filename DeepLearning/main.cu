@@ -145,6 +145,8 @@ public:
         std::default_random_engine generator;
         std::normal_distribution<double> distribution(0.0, 1.0);
 
+        m_as.push_back(nullptr);
+
         // Allocate GPU mem for weights and biases and cost function partial derivatives with respect to them.
         for (size_t layer = 0; layer < m_layerCount - 1; layer++)
         {
@@ -204,6 +206,14 @@ public:
             m_bPartDerivs.push_back(bDevice);
             checkCudaErrors(cudaMalloc(&bDevice, rows * sizeof(double)));
             m_bPartDerivsDelta.push_back(bDevice);
+
+            double* z;
+            checkCudaErrors(cudaMalloc(&z, m_neuronCounts[layer + 1] * sizeof(double)));
+            m_zs.push_back(z);
+
+            double* a;
+            checkCudaErrors(cudaMalloc(&a, m_neuronCounts[layer + 1] * sizeof(double)));
+            m_as.push_back(a);
         }
     }
 
@@ -346,42 +356,31 @@ public:
 
     void backpropagate(double* x, double* y)
     {
-        std::vector<double*> as = { x };
-        std::vector<double*> zs;
+        m_as[0] = x;
 
-        for (size_t layer = 0; layer < m_layerCount - 1; layer++)
-        {
-            double* z;
-            checkCudaErrors(cudaMalloc(&z, m_neuronCounts[layer + 1] * sizeof(double)));
-            zs.push_back(z);
-
-            double* a;
-            checkCudaErrors(cudaMalloc(&a, m_neuronCounts[layer + 1] * sizeof(double)));
-            as.push_back(a);
-        }
         for (size_t layer = 0; layer < m_layerCount - 1; layer++)
         {
             int32_t rows = m_neuronCounts[layer + 1];
             int32_t cols = m_neuronCounts[layer];
 
-            double* a = as[layer];
-            double* aNext = as[layer + 1];
-            double* z = zs[layer];
+            double* a = m_as[layer];
+            double* aNext = m_as[layer + 1];
+            double* z = m_zs[layer];
 
             matVecMulAdd<<<1, rows>>>(m_w[layer].ptr, m_w[layer].pitch, cols, a, m_b[layer], z);
             sigmoid<<<1, rows>>>(z, aNext);
         }
         uint32_t lastLayerSize = m_neuronCounts[m_neuronCounts.size() - 1];
-        calcOutputError<<<1, lastLayerSize>>>(as[as.size() - 1], y, zs[zs.size() - 1], m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1]);
+        calcOutputError<<<1, lastLayerSize>>>(m_as[m_as.size() - 1], y, m_zs[m_zs.size() - 1], m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1]);
         
         dim3 blockSize(m_neuronCounts[m_neuronCounts.size() - 2], m_neuronCounts[m_neuronCounts.size() - 1]);
-        columnProduct<<<1, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1], as[as.size() - 2], 
+        columnProduct<<<1, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1], m_as[m_as.size() - 2],
             m_wPartDerivsDelta[m_wPartDerivsDelta.size() - 1].ptr, m_wPartDerivsDelta[m_wPartDerivsDelta.size() - 1].pitch,
             m_neuronCounts[m_neuronCounts.size() - 1], m_neuronCounts[m_neuronCounts.size() - 2]);
 
         for (size_t layer = 2; layer < m_layerCount; layer++)
         {
-            double* z = zs[zs.size() - layer];
+            double* z = m_zs[m_zs.size() - layer];
 
             int32_t rows = m_neuronCounts[m_neuronCounts.size() - layer + 1];
             int32_t cols = m_neuronCounts[m_neuronCounts.size() - layer];
@@ -396,16 +395,10 @@ public:
             cols = m_neuronCounts[m_neuronCounts.size() - layer - 1];
             dim3 gridSize(static_cast<uint32_t>(std::ceil((double)cols / (double)rows)));
             blockSize = dim3(rows, rows);
-            columnProduct<<<gridSize, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer], as[as.size() - layer - 1], 
+            columnProduct<<<gridSize, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer], m_as[m_as.size() - layer - 1],
                 m_wPartDerivsDelta[m_wPartDerivsDelta.size() - layer].ptr, m_wPartDerivsDelta[m_wPartDerivsDelta.size() - layer].pitch, rows, cols);
 
             checkCudaErrors(cudaFree(wTrans.ptr));
-        }
-
-        for (int i = 0; i < zs.size(); i++)
-        {
-            checkCudaErrors(cudaFree(as[i + 1]));
-            checkCudaErrors(cudaFree(zs[i]));
         }
     }
 
@@ -421,6 +414,9 @@ private:
 
     std::vector<cudaPitchedPtr> m_wPartDerivsDelta;
     std::vector<double*> m_bPartDerivsDelta;
+
+    std::vector<double*> m_as;
+    std::vector<double*> m_zs;
 };
 
 int main()
@@ -435,7 +431,7 @@ int main()
     std::vector<uint32_t> neuronCounts = { elementSize, 30, 10 };
     NeuralNetwork network(neuronCounts);
 
-    network.learn(xs, ys, 2, 10, 3.0);
+    network.learn(xs, ys, 1, 10, 3.0);
 
     for (int i = 0; i < xs.size(); i++)
     {
