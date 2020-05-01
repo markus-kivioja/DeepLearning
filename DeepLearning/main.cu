@@ -8,11 +8,6 @@ __device__ double sigmoid(double z)
     return 1.0 / (1.0 + expf(-z));
 }
 
-__global__ void sigmoid(const double* in, double* out)
-{
-    out[threadIdx.x] = 1.0 / (1.0 + expf(-in[threadIdx.x]));
-}
-
 __device__ double sigmoidDeriv(double z)
 {
     double temp = sigmoid(z);
@@ -63,22 +58,14 @@ __global__ void gradientDescentStep(const void* variables, const void* partialDe
     variablesRow[x] = variablesRow[x] - (learningRate / subsetSize) * partialDerivsRow[x];
 }
 
-__global__ void matVecMulAdd(const void* matrix, size_t pitch, size_t colCount, const double* vector, const double* addVec, double* out)
+__global__ void layerActivation(const void* matrix, size_t pitch, size_t colCount, const double* vector, const double* addVec, double* zOut, double* out)
 {
     size_t idx = threadIdx.x;
     double* row = (double*)(((uint8_t*)matrix) + idx * pitch);
     dot<<<1, colCount, colCount * sizeof(double)>>>(row, vector, &out[idx]);
     cudaDeviceSynchronize();
-    out[idx] += addVec[idx];
-}
-
-__global__ void layerActivation(const void* matrix, size_t pitch, size_t colCount, const double* vector, const double* addVec, double* out)
-{
-    size_t idx = threadIdx.x;
-    double* row = (double*)(((uint8_t*)matrix) + idx * pitch);
-    dot<<<1, colCount, colCount * sizeof(double)>>>(row, vector, &out[idx]);
-    cudaDeviceSynchronize();
-    out[idx] = sigmoid(out[idx] + addVec[idx]);
+    zOut[idx] = out[idx] + addVec[idx];
+    out[idx] = sigmoid(zOut[idx]);
 }
 
 __global__ void columnProduct(const double* vector1, const double* vector2, void* out, size_t pitch, size_t rows, size_t cols)
@@ -250,7 +237,7 @@ public:
             int32_t rows = m_neuronCounts[layer + 1];
             int32_t cols = m_neuronCounts[layer];
 
-            layerActivation<<<1, rows>>>(m_w[layer].ptr, m_w[layer].pitch, cols, as[layer], m_b[layer], as[layer + 1]);
+            layerActivation<<<1, rows>>>(m_w[layer].ptr, m_w[layer].pitch, cols, as[layer], m_b[layer], m_zs[layer], as[layer + 1]);
         }
 
         std::vector<double> result(m_neuronCounts[m_layerCount - 1]);
@@ -367,8 +354,7 @@ public:
             double* aNext = m_as[layer + 1];
             double* z = m_zs[layer];
 
-            matVecMulAdd<<<1, rows>>>(m_w[layer].ptr, m_w[layer].pitch, cols, a, m_b[layer], z);
-            sigmoid<<<1, rows>>>(z, aNext);
+            layerActivation<<<1, rows>>>(m_w[layer].ptr, m_w[layer].pitch, cols, a, m_b[layer], z, aNext);
         }
         uint32_t lastLayerSize = m_neuronCounts[m_neuronCounts.size() - 1];
         calcOutputError<<<1, lastLayerSize>>>(m_as[m_as.size() - 1], y, m_zs[m_zs.size() - 1], m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1]);
@@ -460,7 +446,7 @@ int main()
         if (label == digit) corrects++;
         //printf("Real value is %d, network thinks it's %d\n", label, digit);
     }
-    printf("%f were correct", (double)corrects / (double)testImages.size());
+    printf("%.2f%% were correct", (double)corrects / (double)testImages.size() * 100.0f);
 
     for (int i = 0; i < testImages.size(); i++)
     {
