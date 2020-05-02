@@ -3,6 +3,16 @@
 #include "include/helper_cuda.h"
 #include "include/utils.h"
 
+namespace
+{
+struct Matrix {
+    void* data;
+    size_t pitch;
+    size_t rows;
+    size_t cols;
+};
+}
+
 __device__ double sigmoid(double z)
 {
     return 1.0 / (1.0 + expf(-z));
@@ -19,7 +29,7 @@ __device__ double quadraticCostDeriv(double a, double y)
     return a - y;
 }
 
-__global__ void dot(const double* vec1, const double* vec2, double* out)
+__global__ void dotCDP(const double* vec1, const double* vec2, double* out)
 {
     extern __shared__ double cache[];
     cache[threadIdx.x] = vec1[threadIdx.x] * vec2[threadIdx.x];
@@ -45,37 +55,66 @@ __global__ void dot(const double* vec1, const double* vec2, double* out)
     if (!threadIdx.x) *out = cache[0];
 }
 
-__global__ void gradientDescentStep(const void* variables, const void* partialDerivs, size_t pitch, double learningRate, size_t subsetSize, size_t cols)
+__device__ void dot(const double* vec1, const double* vec2, double* cache)
+{
+    cache[threadIdx.x] = vec1[threadIdx.x] * vec2[threadIdx.x];
+
+    __syncthreads();
+
+    int reducedSize = blockDim.x / 2;
+
+    while (reducedSize > 0)
+    {
+        if (threadIdx.x < reducedSize)
+        {
+            cache[threadIdx.x] += cache[threadIdx.x + reducedSize];
+        }
+        if ((reducedSize > 1) && (reducedSize % 2) && (threadIdx.x == (reducedSize - 1)))
+        {
+            cache[threadIdx.x - 1] += cache[threadIdx.x];
+        }
+        reducedSize /= 2;
+        __syncthreads();
+    }
+}
+
+__global__ void gradientDescentStepW(Matrix variables, Matrix partialDerivs, double learningRate, size_t subsetSize)
 {
     size_t x = blockIdx.x * blockDim.x + threadIdx.x;
     size_t y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x >= cols) return;
+    if (x >= variables.cols) return;
 
-    double* variablesRow = (double*)(((uint8_t*)variables) + y * pitch);
-    double* partialDerivsRow = (double*)(((uint8_t*)partialDerivs) + y * pitch);
+    double* variablesRow = (double*)(((uint8_t*)variables.data) + y * variables.pitch);
+    double* partialDerivsRow = (double*)(((uint8_t*)partialDerivs.data) + y * partialDerivs.pitch);
 
     variablesRow[x] = variablesRow[x] - (learningRate / subsetSize) * partialDerivsRow[x];
 }
 
-__global__ void layerActivation(const void* matrix, size_t pitch, size_t colCount, const double* vector, const double* addVec, double* zOut, double* out)
+__global__ void gradientDescentStepB(double* variables, const double* partialDerivs, double learningRate, size_t subsetSize)
+{
+    size_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    variables[x] = variables[x] - (learningRate / subsetSize) * partialDerivs[x];
+}
+
+__global__ void layerActivationCDP(Matrix matrix, const double* vector, const double* addVec, double* zOut, double* out)
 {
     size_t idx = threadIdx.x;
-    double* row = (double*)(((uint8_t*)matrix) + idx * pitch);
-    dot<<<1, colCount, colCount * sizeof(double)>>>(row, vector, &out[idx]);
+    double* row = (double*)(((uint8_t*)matrix.data) + idx * matrix.pitch);
+    dotCDP<<<1, matrix.cols, matrix.cols * sizeof(double)>>>(row, vector, &out[idx]);
     cudaDeviceSynchronize();
     zOut[idx] = out[idx] + addVec[idx];
     out[idx] = sigmoid(zOut[idx]);
 }
 
-__global__ void columnProduct(const double* vector1, const double* vector2, void* out, size_t pitch, size_t rows, size_t cols)
+__global__ void columnProduct(const double* vector1, const double* vector2, Matrix out)
 {
     size_t x = blockIdx.x * blockDim.x + threadIdx.x;
     size_t y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x >= cols || y >= rows) return;
+    if (x >= out.cols || y >= out.rows) return;
 
-    double* outRow = (double*)(((uint8_t*)out) + y * pitch);
+    double* outRow = (double*)(((uint8_t*)out.data) + y * out.pitch);
     outRow[x] = vector1[y] * vector2[x];
 }
 
@@ -86,7 +125,7 @@ __global__ void calcOutputError(const double* a, const double* y, const double* 
     out[threadIdx.x] = costDeriv * sigDeriv;
 }
 
-__global__ void matTranspose(const void* mat, size_t pitchIn, void* out, size_t pitchOut)
+__global__ void matTranspose(Matrix mat, Matrix out)
 {
     size_t xIn = blockIdx.x * blockDim.x + threadIdx.x;
     size_t yIn = blockIdx.y * blockDim.y + threadIdx.y;
@@ -94,32 +133,37 @@ __global__ void matTranspose(const void* mat, size_t pitchIn, void* out, size_t 
     size_t xOut = yIn;
     size_t yOut = xIn;
 
-    const double* inRow = (double*)(((uint8_t*)mat) + yIn * pitchIn);
-    double* outRow = (double*)(((uint8_t*)out) + yOut * pitchOut);
+    const double* inRow = (double*)(((uint8_t*)mat.data) + yIn * mat.pitch);
+    double* outRow = (double*)(((uint8_t*)out.data) + yOut * out.pitch);
 
     outRow[xOut] = inRow[xIn];
 }
 
-__global__ void calcLayerError(const void* wTrans, size_t pitch, size_t colCount, const double* nextLayerError, const double* z, double* out)
+__global__ void calcLayerErrorCDP(Matrix wTrans, const double* nextLayerError, const double* z, double* out)
 {
     size_t idx = threadIdx.x;
-    double* row = (double*)(((uint8_t*)wTrans) + idx * pitch);
-    dot<<<1, colCount, colCount * sizeof(double)>>>(row, nextLayerError, &out[idx]);
+    double* row = (double*)(((uint8_t*)wTrans.data) + idx * wTrans.pitch);
+    dotCDP<<<1, wTrans.cols, wTrans.cols * sizeof(double)>>>(row, nextLayerError, &out[idx]);
     cudaDeviceSynchronize();
     out[idx] *= sigmoidDeriv(z[idx]);
 }
 
-__global__ void accumulate(void* mat1, const void* mat2, size_t rows, size_t cols, size_t pitch)
+__global__ void accumulateMat(Matrix mat1, Matrix mat2)
 {
     size_t x = blockIdx.x * blockDim.x + threadIdx.x;
     size_t y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x >= cols || y >= rows) return;
+    if (x >= mat1.cols || y >= mat2.rows) return;
 
-    double* row1 = (double*)(((uint8_t*)mat1) + y * pitch);
-    const double* row2 = (double*)(((uint8_t*)mat2) + y * pitch);
+    double* row1 = (double*)(((uint8_t*)mat1.data) + y * mat1.pitch);
+    const double* row2 = (double*)(((uint8_t*)mat2.data) + y * mat2.pitch);
 
     row1[x] += row2[x];
+}
+
+__global__ void accumulateVec(double* vec1, const double* vec2)
+{
+    vec1[threadIdx.x] += vec2[threadIdx.x];
 }
 
 class NeuralNetwork {
@@ -137,42 +181,30 @@ public:
         // Allocate GPU mem for weights and biases and cost function partial derivatives with respect to them.
         for (size_t layer = 0; layer < m_layerCount - 1; layer++)
         {
-            int32_t rows = m_neuronCounts[layer + 1];
-            int32_t cols = m_neuronCounts[layer];
+            size_t rows = m_neuronCounts[layer + 1];
+            size_t cols = m_neuronCounts[layer];
 
             // Initialize weights and copy to GPU
             double* wHostData;
             checkCudaErrors(cudaMallocHost(&wHostData, rows * cols * sizeof(double)));
-            for (int i = 0; i < rows * cols; i++)
+            for (size_t i = 0; i < rows * cols; i++)
             {
                 wHostData[i] = distribution(generator);
             }
 
-            cudaPitchedPtr wDevice;
-            cudaExtent extent = make_cudaExtent(cols * sizeof(double), rows, 1);
-            checkCudaErrors(cudaMalloc3D(&wDevice, extent));
-            m_w.push_back(wDevice);
+            Matrix w = {nullptr, 0, rows, cols};
+            checkCudaErrors(cudaMallocPitch(&w.data, &w.pitch, cols * sizeof(double), rows));
+            m_w.push_back(w);
 
-            cudaPitchedPtr wHost;
-            wHost.ptr = wHostData;
-            wHost.pitch = cols * sizeof(double);
-            wHost.xsize = wDevice.xsize;
-            wHost.ysize = wDevice.ysize;
-
-            cudaMemcpy3DParms cpyParms = { 0 };
-            cpyParms.srcPtr = wHost;
-            cpyParms.dstPtr = wDevice;
-            cpyParms.extent = extent;
-            cpyParms.kind = cudaMemcpyHostToDevice;
-            checkCudaErrors(cudaMemcpy3D(&cpyParms));
+            checkCudaErrors(cudaMemcpy2D(w.data, w.pitch, wHostData, cols * sizeof(double), cols * sizeof(double), rows, cudaMemcpyHostToDevice));
             checkCudaErrors(cudaFreeHost(wHostData));
 
             // Allocate and initialize cost function partial derivatives with rispect to weights
-            checkCudaErrors(cudaMalloc3D(&wDevice, extent));
-            checkCudaErrors(cudaMemset3D(wDevice, 0, extent));
-            m_wPartDerivs.push_back(wDevice);
-            checkCudaErrors(cudaMalloc3D(&wDevice, extent));
-            m_wPartDerivsDelta.push_back(wDevice);
+            checkCudaErrors(cudaMallocPitch(&w.data, &w.pitch, cols * sizeof(double), rows));
+            checkCudaErrors(cudaMemset2D(w.data, w.pitch, 0, cols * sizeof(double), rows));
+            m_wPartDerivs.push_back(w);
+            checkCudaErrors(cudaMallocPitch(&w.data, &w.pitch, cols * sizeof(double), rows));
+            m_wPartDerivsDelta.push_back(w);
 
             // Initialize biases and copy to GPU
             double* bHost;
@@ -201,6 +233,10 @@ public:
             double* a;
             checkCudaErrors(cudaMalloc(&a, m_neuronCounts[layer + 1] * sizeof(double)));
             m_as.push_back(a);
+
+            checkCudaErrors(cudaMallocPitch(&m_wTrans.data, &m_wTrans.pitch, rows * sizeof(double), cols));
+            m_wTrans.cols = rows;
+            m_wTrans.rows = cols;
         }
     }
 
@@ -208,7 +244,7 @@ public:
     {
         for (size_t layer = 0; layer < m_w.size() - 1; layer++)
         {
-            checkCudaErrors(cudaFree(m_w[layer].ptr));
+            checkCudaErrors(cudaFree(m_w[layer].data));
             checkCudaErrors(cudaFree(m_b[layer]));
         }
     }
@@ -237,7 +273,7 @@ public:
             int32_t rows = m_neuronCounts[layer + 1];
             int32_t cols = m_neuronCounts[layer];
 
-            layerActivation<<<1, rows>>>(m_w[layer].ptr, m_w[layer].pitch, cols, as[layer], m_b[layer], m_zs[layer], as[layer + 1]);
+            layerActivationCDP<<<1, rows>>>(m_w[layer], as[layer], m_b[layer], m_zs[layer], as[layer + 1]);
         }
 
         std::vector<double> result(m_neuronCounts[m_layerCount - 1]);
@@ -302,7 +338,7 @@ public:
             int32_t rows = m_neuronCounts[layer + 1];
             int32_t cols = m_neuronCounts[layer];
             cudaExtent extent = make_cudaExtent(cols * sizeof(double), rows, 1);
-            checkCudaErrors(cudaMemset3D(m_wPartDerivs[layer], 0, extent));
+            checkCudaErrors(cudaMemset2D(m_wPartDerivs[layer].data, m_wPartDerivs[layer].pitch, 0, cols * sizeof(double), rows));
             checkCudaErrors(cudaMemset(m_bPartDerivs[layer], 0, rows * sizeof(double)));
         }
     }
@@ -325,8 +361,8 @@ public:
                 int32_t cols = m_neuronCounts[layer];
                 dim3 gridSize(static_cast<uint32_t>(std::ceil((double)cols / (double)rows)));
                 dim3 blockSize(rows, rows);
-                accumulate<<<gridSize, blockSize>>>(m_wPartDerivs[layer].ptr, m_wPartDerivsDelta[layer].ptr, rows, cols, m_wPartDerivs[layer].pitch);
-                accumulate<<<1, rows>>>(m_bPartDerivs[layer], m_bPartDerivsDelta[layer], 1, rows, sizeof(double));
+                accumulateMat<<<gridSize, blockSize>>>(m_wPartDerivs[layer], m_wPartDerivsDelta[layer]);
+                accumulateVec<<<1, rows>>>(m_bPartDerivs[layer], m_bPartDerivsDelta[layer]);
             }
         }
         // Update weights and biases
@@ -336,8 +372,8 @@ public:
             int32_t cols = m_neuronCounts[layer];
             dim3 gridSize(static_cast<uint32_t>(std::ceil((double)cols / (double)rows)));
             dim3 blockSize(rows, rows);
-            gradientDescentStep<<<gridSize, blockSize>>>(m_w[layer].ptr, m_wPartDerivs[layer].ptr, m_w[layer].pitch, learningRate, xs.size(), cols);
-            gradientDescentStep<<<1, rows>>>(m_b[layer], m_bPartDerivs[layer], sizeof(double), learningRate, xs.size(), cols);
+            gradientDescentStepW<<<gridSize, blockSize>>>(m_w[layer], m_wPartDerivs[layer], learningRate, xs.size());
+            gradientDescentStepB<<<1, rows>>>(m_b[layer], m_bPartDerivs[layer], learningRate, xs.size());
         }
     }
 
@@ -354,15 +390,13 @@ public:
             double* aNext = m_as[layer + 1];
             double* z = m_zs[layer];
 
-            layerActivation<<<1, rows>>>(m_w[layer].ptr, m_w[layer].pitch, cols, a, m_b[layer], z, aNext);
+            layerActivationCDP<<<1, rows>>>(m_w[layer], a, m_b[layer], z, aNext);
         }
         uint32_t lastLayerSize = m_neuronCounts[m_neuronCounts.size() - 1];
         calcOutputError<<<1, lastLayerSize>>>(m_as[m_as.size() - 1], y, m_zs[m_zs.size() - 1], m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1]);
         
         dim3 blockSize(m_neuronCounts[m_neuronCounts.size() - 2], m_neuronCounts[m_neuronCounts.size() - 1]);
-        columnProduct<<<1, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1], m_as[m_as.size() - 2],
-            m_wPartDerivsDelta[m_wPartDerivsDelta.size() - 1].ptr, m_wPartDerivsDelta[m_wPartDerivsDelta.size() - 1].pitch,
-            m_neuronCounts[m_neuronCounts.size() - 1], m_neuronCounts[m_neuronCounts.size() - 2]);
+        columnProduct<<<1, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - 1], m_as[m_as.size() - 2], m_wPartDerivsDelta[m_wPartDerivsDelta.size() - 1]);
 
         for (size_t layer = 2; layer < m_layerCount; layer++)
         {
@@ -370,21 +404,15 @@ public:
 
             int32_t rows = m_neuronCounts[m_neuronCounts.size() - layer + 1];
             int32_t cols = m_neuronCounts[m_neuronCounts.size() - layer];
-            cudaExtent wTransExtent = make_cudaExtent(rows * sizeof(double), cols, 1);
-            cudaPitchedPtr wTrans;
-            checkCudaErrors(cudaMalloc3D(&wTrans, wTransExtent));
             dim3 blockSize(cols, rows);
-            matTranspose<<<1, blockSize>>>(m_w[m_w.size() - layer + 1].ptr, m_w[m_w.size() - layer + 1].pitch, wTrans.ptr, wTrans.pitch);
-            calcLayerError<<<1, cols>>>(wTrans.ptr, wTrans.pitch, rows, m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer + 1], z, m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer]);
+            matTranspose<<<1, blockSize>>>(m_w[m_w.size() - layer + 1], m_wTrans);
+            calcLayerErrorCDP<<<1, cols>>>(m_wTrans, m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer + 1], z, m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer]);
 
             rows = m_neuronCounts[m_neuronCounts.size() - layer];
             cols = m_neuronCounts[m_neuronCounts.size() - layer - 1];
             dim3 gridSize(static_cast<uint32_t>(std::ceil((double)cols / (double)rows)));
             blockSize = dim3(rows, rows);
-            columnProduct<<<gridSize, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer], m_as[m_as.size() - layer - 1],
-                m_wPartDerivsDelta[m_wPartDerivsDelta.size() - layer].ptr, m_wPartDerivsDelta[m_wPartDerivsDelta.size() - layer].pitch, rows, cols);
-
-            checkCudaErrors(cudaFree(wTrans.ptr));
+            columnProduct<<<gridSize, blockSize>>>(m_bPartDerivsDelta[m_bPartDerivsDelta.size() - layer], m_as[m_as.size() - layer - 1], m_wPartDerivsDelta[m_wPartDerivsDelta.size() - layer]);
         }
     }
 
@@ -392,17 +420,18 @@ private:
     size_t m_layerCount;
     std::vector<uint32_t> m_neuronCounts;
 
-    std::vector<cudaPitchedPtr> m_w;
+    std::vector<Matrix> m_w;
     std::vector<double*> m_b;
 
-    std::vector<cudaPitchedPtr> m_wPartDerivs;
+    std::vector<Matrix> m_wPartDerivs;
     std::vector<double*> m_bPartDerivs;
 
-    std::vector<cudaPitchedPtr> m_wPartDerivsDelta;
+    std::vector<Matrix> m_wPartDerivsDelta;
     std::vector<double*> m_bPartDerivsDelta;
 
     std::vector<double*> m_as;
     std::vector<double*> m_zs;
+    Matrix m_wTrans;
 };
 
 int main()
@@ -485,8 +514,7 @@ int main()
     double* result;
     checkCudaErrors(cudaMallocManaged(&result, matSize * sizeof(double)));
 
-    layerActivation<<<1, matSize>>>(deviceMatrix.ptr, deviceMatrix.pitch, matSize, vector, vector, result);
-    cudaDeviceSynchronize();
+    layerActivationCDP<<<1, matSize>>>(deviceMatrix.ptr, deviceMatrix.pitch, matSize, vector, vector, result);
 
     for (int i = 0; i < matSize; i++)
         output("%f, ", result[i]);
