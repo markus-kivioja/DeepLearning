@@ -57,15 +57,15 @@ __global__ void dot(const double* vec1, const double* vec2, double* out)
 
 __global__ void gradientDescentStepW(Matrix w, Matrix partialDerivs, double learningRate, size_t subsetSize)
 {
-    size_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t y = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x >= w.cols) return;
+    if (col >= w.cols || row >= w.rows) return;
 
-    double* wRow = (double*)(((uint8_t*)w.data) + y * w.pitch);
-    double* partialDerivsRow = (double*)(((uint8_t*)partialDerivs.data) + y * partialDerivs.pitch);
+    double* wRow = (double*)(((uint8_t*)w.data) + row * w.pitch);
+    double* partialDerivsRow = (double*)(((uint8_t*)partialDerivs.data) + row * partialDerivs.pitch);
 
-    wRow[x] = wRow[x] - (learningRate / subsetSize) * partialDerivsRow[x];
+    wRow[col] = wRow[col] - (learningRate / subsetSize) * partialDerivsRow[col];
 }
 
 __global__ void gradientDescentStepB(double* b, Matrix partialDerivs, double learningRate, size_t subsetSize)
@@ -78,7 +78,7 @@ __global__ void gradientDescentStepB(double* b, Matrix partialDerivs, double lea
         double* pdCol = (double*)(((uint8_t*)partialDerivs.data) + col * partialDerivs.pitch);
         pdSum += pdCol[row];
     }
-    b[row] = b[row] - (learningRate / subsetSize) * pdSum;
+    b[row] = b[row] - (learningRate / (double)subsetSize) * pdSum;
 }
 
 __global__ void layerActivationCDP(Matrix w, const double* a, const double* b, double* zOut, double* out)
@@ -334,7 +334,6 @@ public:
                         xs[subset * m_subsetSize + i], m_neuronCounts[0] * sizeof(double), cudaMemcpyHostToDevice));
                     checkCudaErrors(cudaMemcpy(((uint8_t*)ySubset.data) + i * ySubset.pitch,
                         ys[subset * m_subsetSize + i], m_neuronCounts[m_neuronCounts.size() - 1] * sizeof(double), cudaMemcpyHostToDevice));
-
                 }
 
                 updateSubset(xSubset, ySubset, learningRate);
@@ -424,15 +423,17 @@ int main()
     loadData(L"MNIST/train-images.idx3-ubyte", xs, L"MNIST/train-labels.idx1-ubyte", ys, elementSize);
 
     std::vector<uint32_t> neuronCounts = { elementSize, 30, 10 };
-    NeuralNetwork network(neuronCounts, 10);
+    NeuralNetwork network(neuronCounts, 25);
 
-    network.learn(xs, ys, 1, 3.0);
+    network.learn(xs, ys, 10, 3.0);
 
     for (int i = 0; i < xs.size(); i++)
     {
         delete[] xs[i];
         delete[] ys[i];
     }
+
+    printf("Finished learning. Now checking test images...\n");
 
     std::vector<double*> testImages;
     std::vector<double*> testLabels;
