@@ -422,7 +422,7 @@ int main()
     uint32_t elementSize = 0;
     loadData(L"MNIST/train-images.idx3-ubyte", xs, L"MNIST/train-labels.idx1-ubyte", ys, elementSize);
 
-    std::vector<uint32_t> neuronCounts = { elementSize, 30, 10 };
+    std::vector<uint32_t> neuronCounts = { elementSize, 30, 30, 10 };
     NeuralNetwork network(neuronCounts, 25);
 
     network.learn(xs, ys, 10, 3.0);
