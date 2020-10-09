@@ -1,9 +1,9 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio 15
-VisualStudioVersion = 15.0.28307.902
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.30517.126
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DeepLearning", "DeepLearning\DeepLearning.vcxproj", "{56E4ACE3-1AE9-4AA5-820E-6D73A9FC17D1}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DeepLearning", "DeepLearning\DeepLearning.vcxproj", "{3AC82F8A-49C2-4A4C-A114-4491F9016505}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -11,15 +11,15 @@ Global
 		Release|x64 = Release|x64
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{56E4ACE3-1AE9-4AA5-820E-6D73A9FC17D1}.Debug|x64.ActiveCfg = Debug|x64
-		{56E4ACE3-1AE9-4AA5-820E-6D73A9FC17D1}.Debug|x64.Build.0 = Debug|x64
-		{56E4ACE3-1AE9-4AA5-820E-6D73A9FC17D1}.Release|x64.ActiveCfg = Release|x64
-		{56E4ACE3-1AE9-4AA5-820E-6D73A9FC17D1}.Release|x64.Build.0 = Release|x64
+		{3AC82F8A-49C2-4A4C-A114-4491F9016505}.Debug|x64.ActiveCfg = Debug|x64
+		{3AC82F8A-49C2-4A4C-A114-4491F9016505}.Debug|x64.Build.0 = Debug|x64
+		{3AC82F8A-49C2-4A4C-A114-4491F9016505}.Release|x64.ActiveCfg = Release|x64
+		{3AC82F8A-49C2-4A4C-A114-4491F9016505}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
-		SolutionGuid = {843657CC-2F7C-4220-9BB1-305EA679E6C3}
+		SolutionGuid = {E64BB8F3-4282-48D2-87E9-1FE3389C4EF3}
 	EndGlobalSection
 EndGlobal
